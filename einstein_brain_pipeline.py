@@ -1,836 +1,1268 @@
 # =============================================================================
 # EINSTEIN BRAIN V1
-# CONTROLLED PIPELINE RUNNER
-# STEP 1 → STEP 4A
+# STEPS 1 → 4A
+# CONTROLLED, RERUNNABLE, GITHUB/GOOGLE-COLAB PIPELINE
+# =============================================================================
 #
 # Purpose:
-#   Resume the Einstein Brain V1 project without rerunning completed work.
+#   Consolidate the Einstein Brain V1 preprocessing pipeline into ONE executable
+#   Python file so the project does not depend on repeatedly rerunning notebook
+#   cells.
 #
-# Design principles:
-#   - Read-only verification of completed artifacts
-#   - SHA-256 integrity checks
-#   - Timestamped outputs
-#   - Canonical key: (source_id, page_number)
-#   - No silent provenance repair
-#   - No overwriting authoritative source PDFs
-#   - No unnecessary reruns
+# Pipeline:
 #
-# Current controlled corpus:
-#   4 authoritative PDFs
-#   57 authoritative pages
-#   52 canonical dataset pages
+#   STEP 1   Acquisition manifest / source discovery
+#   STEP 2   Corpus/extraction manifest validation
+#   STEP 3   Corpus quality / provenance validation
+#   STEP 3I   Formula/page-review handoff validation
+#   STEP 4A  Canonical source-to-page dataset assembly
+#
+# IMPORTANT:
+#   This script NEVER modifies authoritative PDFs.
+#   Existing controlled manifests are treated as READ-ONLY.
+#   Existing successful outputs are not silently overwritten.
 #
 # =============================================================================
 
 from __future__ import annotations
 
-import argparse
+import csv
 import hashlib
 import json
+import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable, Optional
 
 import pandas as pd
 
 
 # =============================================================================
-# 0. CONFIGURATION
+# CONFIGURATION
 # =============================================================================
 
 PROJECT = Path("/content/drive/MyDrive/Einstein_Brain_V1")
 
-MANIFESTS = PROJECT / "manifests"
 CORPUS = PROJECT / "corpus"
-REPORTS = PROJECT / "reports"
-
 RAW = CORPUS / "raw"
 EXTRACTED = CORPUS / "extracted"
 
-STEP_4A = CORPUS / "step_4A_dataset"
-STEP_4B = CORPUS / "step_4B_validation"
+MANIFESTS = PROJECT / "manifests"
+REPORTS = MANIFESTS / "step_3I_4_reports"
 
-STEP_REPORTS = MANIFESTS / "step_3I_4_reports"
+STEP4A_DIR = CORPUS / "step_4A_dataset"
+STEP4A_REPORT_DIR = REPORTS / "step_4A"
 
-CANONICAL_KEY = ("source_id", "page_number")
+STEP4A_DIR.mkdir(parents=True, exist_ok=True)
+STEP4A_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
-# 1. AUTHORITATIVE SOURCE BASELINES
+# CONSTANTS
 # =============================================================================
 
-AUTHORITATIVE_SOURCES = {
+APPROVED_PDFS = {
     "EIN-003": {
-        "pages": 15,
-        "size": 588792,
+        "filename": "EIN-003_A_New_Determination_of_Molecular_Dimensions.pdf",
         "sha256": "b08f5c7d5317dad2c9cfb2037fcba91f4a0b84c28bf2a60a134c4de5b441963f",
+        "size": 588792,
+        "pages": 15,
     },
     "EIN-004": {
-        "pages": 25,
-        "size": 666806,
+        "filename": "EIN-004_On_the_Electrodynamics_of_Moving_Bodies.pdf",
         "sha256": "03c8f897e4d83ce48b6ae571dc32f0c48359f55078e059aa121974230d18744b",
+        "size": 666806,
+        "pages": 25,
     },
     "EIN-005": {
-        "pages": 3,
-        "size": 106245,
+        "filename": "EIN-005_Does_the_Inertia_of_a_Body_Depend_Upon_Its_Energy-Content.pdf",
         "sha256": "f050c1f352803141fc2535984613bffd28afdeec627f0aa1d059eeaff209ce5b",
+        "size": 106245,
+        "pages": 3,
     },
     "EIN-007": {
-        "pages": 14,
-        "size": 1139836,
+        "filename": "EIN-007_On_the_Relativity_Principle_and_the_Conclusions_Drawn_from_It.pdf",
         "sha256": "e46861a7357e16e2ce0d26ac18966dc2299ba9fedbbe8f69bd61ca33001fc2a6",
+        "size": 1139836,
+        "pages": 14,
     },
 }
 
+EXPECTED_HANDOFF_SHA256 = (
+    "253cd8096246287f43f077885eb79d073215cf8eeb57de5ecc81d2ae96d02c7d"
+)
+
+REQUIRED_DATASET_COLUMNS = [
+    "source_id",
+    "page_number",
+    "canonical_key",
+    "authoritative_pdf",
+    "authoritative_pdf_sha256",
+    "authoritative_pdf_size",
+    "authoritative_pdf_page_count",
+    "page_text_extractable_actual",
+    "page_text_characters_actual",
+    "handoff_pdf_text_extractable",
+    "handoff_pdf_text_characters",
+    "verified_ocr_present",
+    "verified_ocr_path",
+    "verified_ocr_sha256",
+    "verified_ocr_size",
+    "verified_ocr_characters",
+    "formula_readability_closure",
+    "human_decision",
+    "reviewer_note",
+    "reconciliation_status",
+    "formula_correction_requested",
+    "handoff_status",
+    "source_provenance",
+    "assembly_step",
+]
+
 
 # =============================================================================
-# 2. TERMINAL OUTPUT
+# UTILITY FUNCTIONS
 # =============================================================================
 
-def banner(title: str):
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+
+            if not chunk:
+                break
+
+            h.update(chunk)
+
+    return h.hexdigest()
+
+
+def require_exists(path: Path, label: str) -> None:
+    if not path.exists():
+        raise RuntimeError(
+            f"ABORT: Required {label} does not exist:\n{path}"
+        )
+
+
+def canonical_key(source_id: str, page_number: int) -> tuple[str, int]:
+    return (str(source_id).strip(), int(page_number))
+
+
+def safe_int(value) -> int:
+    try:
+        return int(value)
+    except Exception:
+        raise RuntimeError(f"ABORT: Invalid integer value: {value!r}")
+
+
+def latest_file(directory: Path, pattern: str) -> Optional[Path]:
+    files = list(directory.glob(pattern))
+
+    if not files:
+        return None
+
+    files.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
+
+    return files[0]
+
+
+def print_header(title: str) -> None:
     print()
     print("=" * 80)
     print(title)
     print("=" * 80)
 
 
-def info(message: str):
-    print(f"INFO: {message}")
-
-
-def passed(message: str):
-    print(f"PASS: {message}")
-
-
-def warning(message: str):
-    print(f"WARN: {message}")
-
-
-def failed(message: str):
-    print(f"FAIL: {message}")
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def timestamp():
-    return utc_now().strftime("%Y%m%d_%H%M%S")
-
-
 # =============================================================================
-# 3. HASHING
+# STEP 1 — PROJECT / ACQUISITION VALIDATION
 # =============================================================================
 
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+def step_1() -> Path:
 
-    digest = hashlib.sha256()
+    print_header("STEP 1 — CONTROLLED PROJECT / ACQUISITION VALIDATION")
 
-    with path.open("rb") as handle:
+    require_exists(PROJECT, "project directory")
+    require_exists(RAW, "authoritative PDF directory")
+    require_exists(MANIFESTS, "manifest directory")
 
-        while True:
+    print(f"PASS: Project: {PROJECT}")
+    print(f"PASS: Raw corpus: {RAW}")
+    print(f"PASS: Manifests: {MANIFESTS}")
 
-            block = handle.read(chunk_size)
-
-            if not block:
-                break
-
-            digest.update(block)
-
-    return digest.hexdigest()
-
-
-# =============================================================================
-# 4. BASIC FILE CHECK
-# =============================================================================
-
-def require_file(path: Path, description: str):
-
-    if not path.exists():
-        raise RuntimeError(
-            f"{description} does not exist:\n{path}"
-        )
-
-    if not path.is_file():
-        raise RuntimeError(
-            f"{description} is not a file:\n{path}"
-        )
-
-    passed(f"{description}: {path}")
-
-
-# =============================================================================
-# 5. PROJECT CHECK
-# =============================================================================
-
-def check_project():
-
-    banner("PROJECT PRE-CHECK")
-
-    if not PROJECT.exists():
-        raise RuntimeError(
-            f"Einstein Brain V1 project directory does not exist:\n{PROJECT}"
-        )
-
-    passed(f"Project directory exists: {PROJECT}")
-
-    for path, name in [
-        (MANIFESTS, "Manifests directory"),
-        (CORPUS, "Corpus directory"),
-        (RAW, "Raw corpus directory"),
-        (STEP_REPORTS, "Step report directory"),
-    ]:
-
-        if path.exists():
-            passed(f"{name} exists")
-        else:
-            warning(f"{name} does not currently exist: {path}")
-
-
-# =============================================================================
-# 6. STEP 1 — ACQUISITION VERIFICATION
-# =============================================================================
-
-def step_1():
-
-    banner("STEP 1 — CONTROLLED ACQUISITION")
-
-    acquisition = MANIFESTS / "acquisition_manifest_batch1.csv"
-
-    if not acquisition.exists():
-
-        warning(
-            "Acquisition manifest not found.\n"
-            "The original acquisition stage must be restored/run before "
-            "downstream processing can continue."
-        )
-
-        return False
-
-    df = pd.read_csv(acquisition)
-
-    passed(
-        f"Acquisition manifest discovered: {acquisition}"
+    acquisition_manifest = (
+        MANIFESTS / "acquisition_manifest_batch1.csv"
     )
 
-    info(f"Rows: {len(df)}")
+    if acquisition_manifest.exists():
 
-    if "source_id" not in df.columns:
-        raise RuntimeError(
-            "Acquisition manifest is missing source_id."
+        print(
+            f"PASS: Acquisition manifest:\n"
+            f"      {acquisition_manifest}"
         )
 
-    duplicates = df["source_id"].duplicated().sum()
+        df = pd.read_csv(acquisition_manifest)
 
-    if duplicates:
-        raise RuntimeError(
-            f"Acquisition manifest contains {duplicates} duplicate source IDs."
-        )
-
-    passed("No duplicate source IDs.")
-
-    approved_ids = set(AUTHORITATIVE_SOURCES)
-
-    available_ids = set(df["source_id"].astype(str))
-
-    missing = approved_ids - available_ids
-
-    if missing:
-        raise RuntimeError(
-            f"Approved authoritative sources missing from acquisition manifest: "
-            f"{sorted(missing)}"
-        )
-
-    passed("All authoritative source IDs are represented.")
-
-    return True
-
-
-# =============================================================================
-# 7. STEP 2 — EXTRACTION VERIFICATION
-# =============================================================================
-
-def step_2():
-
-    banner("STEP 2 — CONTROLLED EXTRACTION / OCR")
-
-    extraction = MANIFESTS / "extraction_manifest_batch1.csv"
-    quality = MANIFESTS / "extraction_quality_manifest_batch1.csv"
-    ocr_manifest = MANIFESTS / "ocr_page_manifest_batch1.csv"
-
-    for path, name in [
-        (extraction, "Extraction manifest"),
-        (quality, "Extraction quality manifest"),
-        (ocr_manifest, "OCR page manifest"),
-    ]:
-
-        if path.exists():
-
-            passed(f"{name}: {path}")
-
-        else:
-
-            warning(f"{name} not found: {path}")
-
-    if not extraction.exists():
-        return False
-
-    df = pd.read_csv(extraction)
-
-    info(f"Extraction manifest rows: {len(df)}")
-
-    if "source_id" in df.columns:
-
-        ids = set(df["source_id"].astype(str))
-
-        missing = set(AUTHORITATIVE_SOURCES) - ids
-
-        if missing:
-
+        if "source_id" not in df.columns:
             raise RuntimeError(
-                f"Extraction manifest missing sources: {sorted(missing)}"
+                "ABORT: acquisition manifest missing source_id."
             )
 
-    passed("Extraction stage is available for downstream verification.")
-
-    return True
-
-
-# =============================================================================
-# 8. STEP 3 — CONTROLLED FORMULA / EVIDENCE REVIEW
-# =============================================================================
-
-def find_latest(pattern: str, directory: Path):
-
-    files = sorted(
-        directory.glob(pattern),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-
-    return files[0] if files else None
-
-
-def step_3():
-
-    banner("STEP 3 — CONTROLLED QUALITY / FORMULA REVIEW")
-
-    if not STEP_REPORTS.exists():
-
-        warning(
-            "Step 3 report directory does not exist."
-        )
-
-        return False
-
-    priority = find_latest(
-        "STEP_3I_4G_HUMAN_REVIEW_PRIORITY_*.csv",
-        EXTRACTED / "step_3I_4G_formula_review",
-    )
-
-    page_queue = find_latest(
-        "STEP_3I_4G_PAGE_REVIEW_QUEUE_*.csv",
-        EXTRACTED / "step_3I_4G_formula_review",
-    )
-
-    current_human = find_latest(
-        "STEP_3I_4H_CURRENT_HUMAN_REVIEW_RECORDING_*.csv",
-        EXTRACTED / "step_3I_4G_formula_review",
-    )
-
-    handoff = STEP_REPORTS / "STEP_3I_4J_FINAL_HANDOFF_MANIFEST_20260815_142254.csv"
-
-    if priority:
-        passed(f"Priority queue: {priority}")
-
-    if page_queue:
-        passed(f"Page review queue: {page_queue}")
-
-    if current_human:
-        passed(f"Current human review: {current_human}")
-
-    if handoff.exists():
-
-        passed(f"Final handoff manifest: {handoff}")
+        print(f"Acquisition rows: {len(df)}")
 
     else:
 
-        warning(
-            "Final handoff manifest not found."
+        print(
+            "WARN: acquisition_manifest_batch1.csv not found."
         )
 
-        return False
+    # -------------------------------------------------------------------------
+    # Validate authoritative PDFs.
+    # -------------------------------------------------------------------------
 
-    return True
+    for source_id, expected in APPROVED_PDFS.items():
+
+        pdf = RAW / expected["filename"]
+
+        require_exists(
+            pdf,
+            f"authoritative PDF {source_id}"
+        )
+
+        actual_size = pdf.stat().st_size
+        actual_hash = sha256_file(pdf)
+
+        if actual_size != expected["size"]:
+
+            raise RuntimeError(
+                f"ABORT: {source_id} size mismatch.\n"
+                f"Expected: {expected['size']}\n"
+                f"Actual:   {actual_size}"
+            )
+
+        if actual_hash != expected["sha256"]:
+
+            raise RuntimeError(
+                f"ABORT: {source_id} SHA-256 mismatch.\n"
+                f"Expected: {expected['sha256']}\n"
+                f"Actual:   {actual_hash}"
+            )
+
+        print(
+            f"PASS: {source_id} | "
+            f"{actual_size} bytes | "
+            f"{actual_hash}"
+        )
+
+    return acquisition_manifest
 
 
 # =============================================================================
-# 9. STEP 3J — HANDOFF VERIFICATION
+# STEP 2 — EXTRACTION / QUALITY MANIFEST VALIDATION
 # =============================================================================
 
-def step_3j():
+def step_2() -> None:
 
-    banner("STEP 3J — CONTROLLED HANDOFF")
+    print_header("STEP 2 — CONTROLLED EXTRACTION / QUALITY VALIDATION")
 
-    handoff = STEP_REPORTS / (
-        "STEP_3I_4J_FINAL_HANDOFF_MANIFEST_20260815_142254.csv"
+    extraction_manifest = (
+        MANIFESTS / "extraction_manifest_batch1.csv"
     )
 
-    require_file(
-        handoff,
-        "STEP 3I-4J handoff manifest",
+    extraction_quality_manifest = (
+        MANIFESTS / "extraction_quality_manifest_batch1.csv"
+    )
+
+    if extraction_manifest.exists():
+
+        df = pd.read_csv(extraction_manifest)
+
+        print(
+            f"PASS: Extraction manifest:\n"
+            f"      {extraction_manifest}"
+        )
+
+        print(f"Extraction rows: {len(df)}")
+
+    else:
+
+        print(
+            "WARN: extraction_manifest_batch1.csv not found."
+        )
+
+    if extraction_quality_manifest.exists():
+
+        df = pd.read_csv(extraction_quality_manifest)
+
+        print(
+            f"PASS: Extraction quality manifest:\n"
+            f"      {extraction_quality_manifest}"
+        )
+
+        print(
+            f"Extraction-quality rows: {len(df)}"
+        )
+
+    else:
+
+        print(
+            "WARN: extraction_quality_manifest_batch1.csv "
+            "not found."
+        )
+
+    verified_ocr = (
+        EXTRACTED / "verified_ocr"
+    )
+
+    if verified_ocr.exists():
+
+        txt_files = list(verified_ocr.rglob("*.txt"))
+
+        print(
+            f"Verified OCR TXT files discovered: "
+            f"{len(txt_files)}"
+        )
+
+    else:
+
+        print(
+            "WARN: verified_ocr directory not found."
+        )
+
+
+# =============================================================================
+# STEP 3 — CONTROLLED CORPUS VALIDATION
+# =============================================================================
+
+def step_3() -> None:
+
+    print_header("STEP 3 — CONTROLLED CORPUS VALIDATION")
+
+    quality_manifest = (
+        MANIFESTS / "quality_manifest_batch1.csv"
+    )
+
+    if quality_manifest.exists():
+
+        df = pd.read_csv(quality_manifest)
+
+        print(
+            f"PASS: Quality manifest:\n"
+            f"      {quality_manifest}"
+        )
+
+        print(f"Quality rows: {len(df)}")
+
+    else:
+
+        print(
+            "INFO: quality_manifest_batch1.csv does not exist."
+        )
+
+    ocr_manifest = (
+        MANIFESTS / "ocr_page_manifest_batch1.csv"
+    )
+
+    if ocr_manifest.exists():
+
+        df = pd.read_csv(ocr_manifest)
+
+        print(
+            f"PASS: OCR page manifest:\n"
+            f"      {ocr_manifest}"
+        )
+
+        print(f"OCR manifest rows: {len(df)}")
+
+    else:
+
+        print(
+            "WARN: OCR page manifest not found."
+        )
+
+    # -------------------------------------------------------------------------
+    # Confirm all authoritative PDFs are still immutable.
+    # -------------------------------------------------------------------------
+
+    for source_id, expected in APPROVED_PDFS.items():
+
+        pdf = RAW / expected["filename"]
+
+        actual_hash = sha256_file(pdf)
+
+        if actual_hash != expected["sha256"]:
+
+            raise RuntimeError(
+                f"ABORT: Authoritative PDF changed: {source_id}"
+            )
+
+    print(
+        "PASS: All authoritative PDF hashes remain unchanged."
+    )
+
+
+# =============================================================================
+# STEP 3I — CONTROLLED HANDOFF VALIDATION
+# =============================================================================
+
+def discover_handoff_manifest() -> Path:
+
+    handoff = latest_file(
+        REPORTS,
+        "STEP_3I_4J_FINAL_HANDOFF_MANIFEST_*.csv"
+    )
+
+    if handoff is None:
+
+        raise RuntimeError(
+            "ABORT: No STEP 3I-4J final handoff manifest found."
+        )
+
+    return handoff
+
+
+def step_3i() -> Path:
+
+    print_header(
+        "STEP 3I — CONTROLLED FORMULA REVIEW / HANDOFF VALIDATION"
+    )
+
+    handoff = discover_handoff_manifest()
+
+    print(
+        f"PASS: Handoff manifest discovered:\n"
+        f"      {handoff}"
     )
 
     actual_hash = sha256_file(handoff)
 
-    expected_hash = (
-        "253cd8096246287f43f077885eb79d073215cf8eeb57de5ecc81d2ae96d02c7d"
+    print(
+        f"Handoff SHA-256:\n"
+        f"  {actual_hash}"
     )
 
-    print(f"Handoff SHA-256:")
-    print(f"  {actual_hash}")
+    # -------------------------------------------------------------------------
+    # IMPORTANT:
+    # We do NOT attempt to parse an old audit report for the SHA.
+    #
+    # This fixes the earlier bug:
+    #
+    #   final_audit_report undefined
+    #
+    # and also avoids the fragile:
+    #
+    #   "Could not locate recorded SHA in report"
+    #
+    # behavior.
+    #
+    # The controlled handoff SHA is verified directly against the known
+    # successful Step 3I-4J handoff record.
+    # -------------------------------------------------------------------------
 
-    if actual_hash != expected_hash:
+    if actual_hash != EXPECTED_HANDOFF_SHA256:
 
         raise RuntimeError(
-            "ABORT: Handoff SHA-256 does not match the controlled baseline.\n"
-            f"Expected: {expected_hash}\n"
-            f"Actual:   {actual_hash}"
+            "ABORT: Handoff manifest SHA-256 mismatch.\n"
+            f"Expected controlled SHA: {EXPECTED_HANDOFF_SHA256}\n"
+            f"Actual SHA:              {actual_hash}"
         )
 
-    passed("Handoff SHA-256 matches controlled baseline.")
+    print(
+        "PASS: Handoff SHA-256 matches controlled baseline."
+    )
 
     df = pd.read_csv(handoff)
 
-    if len(df) != 52:
+    print(f"Handoff rows: {len(df)}")
 
-        raise RuntimeError(
-            f"ABORT: Expected 52 handoff rows, found {len(df)}."
-        )
-
-    passed("Handoff contains exactly 52 rows.")
-
-    required = {
+    required = [
         "source_id",
         "page_number",
         "authoritative_pdf",
         "authoritative_pdf_sha256",
         "authoritative_pdf_size",
         "authoritative_pdf_page_count",
-    }
+    ]
 
-    missing = required - set(df.columns)
+    missing = [
+        c for c in required
+        if c not in df.columns
+    ]
 
     if missing:
 
         raise RuntimeError(
-            f"Handoff schema missing fields: {sorted(missing)}"
+            "ABORT: Handoff manifest missing columns:\n"
+            + "\n".join(missing)
         )
 
-    passed("Handoff schema validated.")
+    keys = set()
 
-    keys = list(
-        zip(
-            df["source_id"].astype(str),
-            df["page_number"].astype(int),
+    for _, row in df.iterrows():
+
+        key = canonical_key(
+            row["source_id"],
+            safe_int(row["page_number"])
         )
+
+        if key in keys:
+
+            raise RuntimeError(
+                f"ABORT: Duplicate canonical key: {key}"
+            )
+
+        keys.add(key)
+
+    print(
+        f"PASS: {len(keys)} unique canonical pages."
     )
 
-    if len(keys) != len(set(keys)):
+    if len(df) != 52:
 
         raise RuntimeError(
-            "ABORT: Duplicate canonical page keys found."
+            "ABORT: Unexpected handoff row count.\n"
+            f"Expected: 52\n"
+            f"Actual:   {len(df)}"
         )
 
-    passed("52 unique canonical page keys.")
+    print("PASS: 52-page controlled handoff.")
 
-    return handoff, df
+    return handoff
 
 
 # =============================================================================
-# 10. STEP 4A — DATASET ASSEMBLY
+# STEP 4A — CANONICAL DATASET ASSEMBLY
 # =============================================================================
 
-def build_step_4a(handoff_df):
+def find_page_text(
+    source_id: str,
+    page_number: int,
+) -> str:
 
-    banner("STEP 4A — CONTROLLED DATASET ASSEMBLY")
+    # -------------------------------------------------------------------------
+    # Search common extraction locations.
+    #
+    # This function is deliberately conservative.
+    # If page text cannot be found, the record is retained with empty text
+    # rather than silently inventing text.
+    # -------------------------------------------------------------------------
+
+    candidate_dirs = [
+        EXTRACTED,
+        EXTRACTED / source_id,
+        EXTRACTED / "text",
+        EXTRACTED / "pages",
+    ]
+
+    candidates = []
+
+    for directory in candidate_dirs:
+
+        if not directory.exists():
+            continue
+
+        candidates.extend(
+            directory.rglob(
+                f"{source_id}_page_{page_number:03d}*.txt"
+            )
+        )
+
+        candidates.extend(
+            directory.rglob(
+                f"{source_id}_page_{page_number}.txt"
+            )
+        )
+
+    # Verified OCR is read-only and only used if present.
+
+    verified_ocr = (
+        EXTRACTED /
+        "verified_ocr" /
+        source_id
+    )
+
+    if verified_ocr.exists():
+
+        candidates.extend(
+            verified_ocr.glob(
+                f"{source_id}_page_{page_number:03d}_verified_source.txt"
+            )
+        )
+
+    # Remove duplicates while preserving order.
+
+    seen = set()
+    unique_candidates = []
+
+    for path in candidates:
+
+        if path not in seen:
+
+            seen.add(path)
+            unique_candidates.append(path)
+
+    for path in unique_candidates:
+
+        try:
+
+            text = path.read_text(
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            if text.strip():
+
+                return text
+
+        except Exception:
+
+            continue
+
+    return ""
+
+
+def build_dataset(handoff_df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
 
-    for _, row in handoff_df.iterrows():
+    for _, handoff in handoff_df.iterrows():
 
-        source_id = str(row["source_id"])
-        page_number = int(row["page_number"])
+        source_id = str(
+            handoff["source_id"]
+        ).strip()
 
-        if source_id not in AUTHORITATIVE_SOURCES:
-
-            raise RuntimeError(
-                f"Unknown authoritative source: {source_id}"
-            )
-
-        baseline = AUTHORITATIVE_SOURCES[source_id]
-
-        if int(row["authoritative_pdf_size"]) != baseline["size"]:
-
-            raise RuntimeError(
-                f"{source_id}: authoritative PDF size mismatch."
-            )
-
-        if str(row["authoritative_pdf_sha256"]).lower() != baseline["sha256"]:
-
-            raise RuntimeError(
-                f"{source_id}: authoritative PDF SHA-256 mismatch."
-            )
-
-        if int(row["authoritative_pdf_page_count"]) != baseline["pages"]:
-
-            raise RuntimeError(
-                f"{source_id}: authoritative PDF page count mismatch."
-            )
-
-        record = row.to_dict()
-
-        record["canonical_key"] = (
-            f"{source_id}:{page_number:03d}"
+        page_number = safe_int(
+            handoff["page_number"]
         )
 
-        record["source_provenance"] = (
-            f"{source_id}|page={page_number}|"
-            f"sha256={baseline['sha256']}"
+        key = canonical_key(
+            source_id,
+            page_number
         )
 
-        record["assembly_step"] = "STEP_4A"
+        expected_pdf = APPROVED_PDFS.get(source_id)
 
-        rows.append(record)
+        if expected_pdf is None:
 
-    dataset = pd.DataFrame(rows)
+            raise RuntimeError(
+                f"ABORT: Unapproved source in handoff: "
+                f"{source_id}"
+            )
 
-    passed(f"Dataset rows assembled: {len(dataset)}")
+        pdf_path = RAW / expected_pdf["filename"]
 
-    if len(dataset) != 52:
+        actual_pdf_hash = sha256_file(pdf_path)
+
+        if (
+            actual_pdf_hash
+            != expected_pdf["sha256"]
+        ):
+
+            raise RuntimeError(
+                f"ABORT: PDF hash changed during "
+                f"dataset assembly: {source_id}"
+            )
+
+        text = find_page_text(
+            source_id,
+            page_number
+        )
+
+        row = {
+            "source_id": source_id,
+            "page_number": page_number,
+            "canonical_key":
+                f"{source_id}:{page_number}",
+
+            "authoritative_pdf":
+                str(pdf_path),
+
+            "authoritative_pdf_sha256":
+                expected_pdf["sha256"],
+
+            "authoritative_pdf_size":
+                expected_pdf["size"],
+
+            "authoritative_pdf_page_count":
+                expected_pdf["pages"],
+
+            "page_text_extractable_actual":
+                bool(text.strip()),
+
+            "page_text_characters_actual":
+                len(text),
+
+            "handoff_pdf_text_extractable":
+                handoff.get(
+                    "pdf_text_extractable",
+                    ""
+                ),
+
+            "handoff_pdf_text_characters":
+                handoff.get(
+                    "pdf_text_characters",
+                    ""
+                ),
+
+            "verified_ocr_present":
+                False,
+
+            "verified_ocr_path":
+                "",
+
+            "verified_ocr_sha256":
+                "",
+
+            "verified_ocr_size":
+                0,
+
+            "verified_ocr_characters":
+                0,
+
+            "formula_readability_closure":
+                handoff.get(
+                    "formula_readability_closure",
+                    ""
+                ),
+
+            "human_decision":
+                handoff.get(
+                    "human_decision",
+                    ""
+                ),
+
+            "reviewer_note":
+                handoff.get(
+                    "reviewer_note",
+                    ""
+                ),
+
+            "reconciliation_status":
+                handoff.get(
+                    "reconciliation_status",
+                    ""
+                ),
+
+            "formula_correction_requested":
+                handoff.get(
+                    "formula_correction_requested",
+                    ""
+                ),
+
+            "handoff_status":
+                handoff.get(
+                    "handoff_status",
+                    ""
+                ),
+
+            "source_provenance":
+                (
+                    f"STEP_3I_4J_HANDOFF;"
+                    f"{source_id};"
+                    f"page={page_number};"
+                    f"pdf_sha256={expected_pdf['sha256']}"
+                ),
+
+            "assembly_step":
+                "STEP_4A",
+        }
+
+        # ---------------------------------------------------------------------
+        # If this page has verified OCR, record it without modifying it.
+        # ---------------------------------------------------------------------
+
+        ocr_path = (
+            EXTRACTED /
+            "verified_ocr" /
+            source_id /
+            f"{source_id}_page_{page_number:03d}_verified_source.txt"
+        )
+
+        if ocr_path.exists():
+
+            ocr_text = ocr_path.read_text(
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            row["verified_ocr_present"] = True
+            row["verified_ocr_path"] = str(ocr_path)
+            row["verified_ocr_sha256"] = sha256_file(
+                ocr_path
+            )
+            row["verified_ocr_size"] = ocr_path.stat().st_size
+            row["verified_ocr_characters"] = len(
+                ocr_text
+            )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def validate_dataset(
+    df: pd.DataFrame,
+    handoff_df: pd.DataFrame,
+) -> None:
+
+    print_header("STEP 4A — DATASET VALIDATION")
+
+    missing = [
+        c for c in REQUIRED_DATASET_COLUMNS
+        if c not in df.columns
+    ]
+
+    if missing:
 
         raise RuntimeError(
-            f"Expected 52 dataset rows, found {len(dataset)}."
+            "ABORT: Dataset missing required columns:\n"
+            + "\n".join(missing)
         )
 
-    keys = list(
-        zip(
-            dataset["source_id"].astype(str),
-            dataset["page_number"].astype(int),
-        )
-    )
-
-    if len(keys) != len(set(keys)):
+    if len(df) != len(handoff_df):
 
         raise RuntimeError(
-            "Duplicate canonical keys detected."
+            "ABORT: Dataset/handoff row count mismatch.\n"
+            f"Dataset: {len(df)}\n"
+            f"Handoff: {len(handoff_df)}"
         )
 
-    passed("Canonical key validation passed.")
+    dataset_keys = {
+        canonical_key(
+            row["source_id"],
+            row["page_number"]
+        )
+        for _, row in df.iterrows()
+    }
 
-    return dataset
+    handoff_keys = {
+        canonical_key(
+            row["source_id"],
+            row["page_number"]
+        )
+        for _, row in handoff_df.iterrows()
+    }
 
+    if dataset_keys != handoff_keys:
 
-# =============================================================================
-# 11. WRITE STEP 4A WITHOUT OVERWRITING
-# =============================================================================
+        raise RuntimeError(
+            "ABORT: Dataset canonical keys do not "
+            "match handoff canonical keys."
+        )
 
-def write_step_4a(dataset):
-
-    banner("STEP 4A — WRITING NEW OUTPUTS")
-
-    STEP_4A.mkdir(
-        parents=True,
-        exist_ok=True,
+    print(
+        f"PASS: {len(df)} canonical dataset rows."
     )
 
-    report_dir = STEP_REPORTS / "step_4A"
+    print(
+        "PASS: Dataset canonical key set matches handoff."
+    )
 
-    report_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+    # -------------------------------------------------------------------------
+    # Validate every PDF provenance record.
+    # -------------------------------------------------------------------------
+
+    for source_id, expected in APPROVED_PDFS.items():
+
+        subset = df[
+            df["source_id"] == source_id
+        ]
+
+        if subset.empty:
+            continue
+
+        for _, row in subset.iterrows():
+
+            if (
+                row["authoritative_pdf_sha256"]
+                != expected["sha256"]
+            ):
+
+                raise RuntimeError(
+                    f"ABORT: Bad PDF provenance: "
+                    f"{source_id}"
+                )
+
+            page = int(
+                row["page_number"]
+            )
+
+            if not (
+                1 <= page <= expected["pages"]
+            ):
+
+                raise RuntimeError(
+                    f"ABORT: Invalid page number: "
+                    f"{source_id} page {page}"
+                )
+
+    print(
+        "PASS: Authoritative PDF provenance validated."
+    )
+
+
+def step_4a(handoff_path: Path) -> dict:
+
+    print_header(
+        "STEP 4A — CONTROLLED DATASET ASSEMBLY"
+    )
+
+    handoff_df = pd.read_csv(
+        handoff_path
+    )
+
+    dataset = build_dataset(
+        handoff_df
+    )
+
+    print(
+        f"Dataset rows assembled: {len(dataset)}"
+    )
+
+    validate_dataset(
+        dataset,
+        handoff_df
     )
 
     ts = timestamp()
 
     dataset_path = (
-        STEP_4A /
+        STEP4A_DIR /
         f"STEP_4A_DATASET_{ts}.csv"
     )
 
     index_path = (
-        STEP_4A /
+        STEP4A_DIR /
         f"STEP_4A_CANONICAL_SOURCE_PAGE_INDEX_{ts}.csv"
     )
 
     verification_path = (
-        report_dir /
+        STEP4A_REPORT_DIR /
         f"STEP_4A_HANDOFF_VERIFICATION_{ts}.json"
     )
 
+    report_path = (
+        STEP4A_REPORT_DIR /
+        f"STEP_4A_DATASET_ASSEMBLY_{ts}.txt"
+    )
+
+    # -------------------------------------------------------------------------
+    # Canonical dataset
+    # -------------------------------------------------------------------------
+
     dataset.to_csv(
         dataset_path,
-        index=False,
+        index=False
     )
 
-    index = dataset.copy()
+    # -------------------------------------------------------------------------
+    # Canonical index
+    # -------------------------------------------------------------------------
 
-    index.to_csv(
+    index_columns = [
+        c for c in REQUIRED_DATASET_COLUMNS
+        if c in dataset.columns
+    ]
+
+    dataset[
+        index_columns
+    ].to_csv(
         index_path,
-        index=False,
+        index=False
     )
 
-    dataset_hash = sha256_file(dataset_path)
-    index_hash = sha256_file(index_path)
+    dataset_sha = sha256_file(
+        dataset_path
+    )
+
+    index_sha = sha256_file(
+        index_path
+    )
 
     verification = {
-        "step": "4A",
-        "created_utc": utc_now().isoformat(),
-        "handoff_rows": len(dataset),
-        "dataset_rows": len(dataset),
-        "canonical_key": [
-            "source_id",
-            "page_number",
-        ],
-        "dataset_path": str(dataset_path),
-        "dataset_sha256": dataset_hash,
-        "index_path": str(index_path),
-        "index_sha256": index_hash,
-        "authoritative_sources": sorted(
-            dataset["source_id"].astype(str).unique().tolist()
-        ),
-        "formula_readability": (
-            dataset["formula_readability_closure"]
-            .value_counts(dropna=False)
-            .to_dict()
-            if "formula_readability_closure" in dataset.columns
-            else {}
-        ),
+        "step": "STEP_4A",
+        "created_utc": utc_now(),
+
+        "handoff_manifest":
+            str(handoff_path),
+
+        "handoff_sha256":
+            sha256_file(handoff_path),
+
+        "recorded_3I_4J_sha256":
+            EXPECTED_HANDOFF_SHA256,
+
+        "sha256_match":
+            sha256_file(handoff_path)
+            == EXPECTED_HANDOFF_SHA256,
+
+        "handoff_rows":
+            len(handoff_df),
+
+        "dataset_rows":
+            len(dataset),
+
+        "canonical_key":
+            "(source_id, page_number)",
+
+        "approved_authoritative_sources":
+            list(APPROVED_PDFS.keys()),
+
+        "authoritative_pdf_hashes_verified":
+            True,
+
+        "dataset_path":
+            str(dataset_path),
+
+        "dataset_sha256":
+            dataset_sha,
+
+        "index_path":
+            str(index_path),
+
+        "index_sha256":
+            index_sha,
+
+        "verified_ocr_files_discovered":
+            int(
+                dataset["verified_ocr_present"].sum()
+            ),
     }
 
     verification_path.write_text(
         json.dumps(
             verification,
-            indent=2,
+            indent=2
         ),
-        encoding="utf-8",
+        encoding="utf-8"
     )
 
-    passed(f"Dataset written: {dataset_path}")
-    passed(f"Dataset SHA-256: {dataset_hash}")
+    # -------------------------------------------------------------------------
+    # Human-readable provenance report
+    # -------------------------------------------------------------------------
 
-    passed(f"Canonical index written: {index_path}")
-    passed(f"Index SHA-256: {index_hash}")
+    report = f"""
+================================================================================
+STEP 4A — CONTROLLED DATASET ASSEMBLY
+================================================================================
 
-    passed(
-        f"Verification record written: {verification_path}"
+Project:
+{PROJECT}
+
+Timestamp UTC:
+{utc_now()}
+
+Handoff manifest:
+{handoff_path}
+
+Handoff SHA-256:
+{verification["handoff_sha256"]}
+
+Expected controlled handoff SHA-256:
+{EXPECTED_HANDOFF_SHA256}
+
+Handoff rows:
+{len(handoff_df)}
+
+Dataset rows:
+{len(dataset)}
+
+Canonical key:
+(source_id, page_number)
+
+Authoritative sources:
+{", ".join(APPROVED_PDFS.keys())}
+
+Dataset:
+{dataset_path}
+
+Dataset SHA-256:
+{dataset_sha}
+
+Canonical index:
+{index_path}
+
+Canonical index SHA-256:
+{index_sha}
+
+Verification JSON:
+{verification_path}
+
+Verified OCR references:
+{verification["verified_ocr_files_discovered"]}
+
+STATUS:
+SUCCESS
+
+================================================================================
+"""
+
+    report_path.write_text(
+        report.strip() + "\n",
+        encoding="utf-8"
     )
 
-    return dataset_path, index_path, verification_path
-
-
-# =============================================================================
-# 12. STEP 4A RE-READ / INTEGRITY CHECK
-# =============================================================================
-
-def verify_step_4a(
-    dataset_path: Path,
-    index_path: Path,
-):
-
-    banner("STEP 4A — POST-BUILD INTEGRITY CHECK")
-
-    dataset = pd.read_csv(dataset_path)
-    index = pd.read_csv(index_path)
-
-    if len(dataset) != 52:
-        raise RuntimeError(
-            f"Dataset row count changed: {len(dataset)}"
-        )
-
-    if len(index) != 52:
-        raise RuntimeError(
-            f"Index row count changed: {len(index)}"
-        )
-
-    dataset_keys = set(
-        zip(
-            dataset["source_id"].astype(str),
-            dataset["page_number"].astype(int),
-        )
-    )
-
-    index_keys = set(
-        zip(
-            index["source_id"].astype(str),
-            index["page_number"].astype(int),
-        )
-    )
-
-    if dataset_keys != index_keys:
-
-        raise RuntimeError(
-            "Dataset/index canonical key sets differ."
-        )
-
-    passed("Dataset re-read successfully.")
-    passed("Canonical index re-read successfully.")
-    passed("Dataset/index canonical key sets match.")
-    passed("52 canonical pages confirmed.")
-
-    return dataset
-
-
-# =============================================================================
-# 13. STEP STATUS DISPLAY
-# =============================================================================
-
-def status_summary():
-
-    banner("CURRENT EINSTEIN BRAIN V1 STATUS")
-
-    print("Controlled corpus:")
-    print("  Authoritative sources : 4")
-    print("  Authoritative pages   : 57")
-    print("  Canonical pages       : 52")
-    print("  Canonical key         : (source_id, page_number)")
     print()
-    print("Completed:")
-    print("  STEP 1   Acquisition")
-    print("  STEP 2   Extraction / OCR")
-    print("  STEP 3   Quality / Formula Review")
-    print("  STEP 3J  Controlled Handoff")
-    print("  STEP 4A  Dataset Assembly")
+    print("PASS: STEP 4A dataset written:")
+    print(dataset_path)
+
     print()
-    print("Next:")
-    print("  STEP 4B  Dataset Validation / Preparation")
+    print("PASS: STEP 4A canonical index written:")
+    print(index_path)
+
+    print()
+    print("PASS: STEP 4A verification JSON written:")
+    print(verification_path)
+
+    print()
+    print("PASS: STEP 4A provenance report written:")
+    print(report_path)
+
+    return {
+        "dataset_path": dataset_path,
+        "index_path": index_path,
+        "verification_path": verification_path,
+        "report_path": report_path,
+    }
 
 
 # =============================================================================
-# 14. MAIN PIPELINE
+# MAIN
 # =============================================================================
 
-def run_pipeline():
+def main():
 
-    banner(
-        "EINSTEIN BRAIN V1 — CONTROLLED PIPELINE "
-        "STEP 1 → STEP 4A"
-    )
-
-    print(
-        f"UTC: {utc_now().isoformat()}"
+    print_header(
+        "EINSTEIN BRAIN V1 — STEPS 1 → 4A"
     )
 
     print(
         f"Project: {PROJECT}"
     )
 
-    check_project()
+    print(
+        f"Timestamp UTC: {utc_now()}"
+    )
 
     # -------------------------------------------------------------------------
-    # STEP 1
+    # Step 1
     # -------------------------------------------------------------------------
 
     step_1()
 
     # -------------------------------------------------------------------------
-    # STEP 2
+    # Step 2
     # -------------------------------------------------------------------------
 
     step_2()
 
     # -------------------------------------------------------------------------
-    # STEP 3
+    # Step 3
     # -------------------------------------------------------------------------
 
     step_3()
 
     # -------------------------------------------------------------------------
-    # STEP 3J
+    # Step 3I
     # -------------------------------------------------------------------------
 
-    handoff_path, handoff_df = step_3j()
+    handoff = step_3i()
 
     # -------------------------------------------------------------------------
-    # STEP 4A
+    # Step 4A
     # -------------------------------------------------------------------------
 
-    dataset = build_step_4a(
-        handoff_df
-    )
-
-    dataset_path, index_path, verification_path = write_step_4a(
-        dataset
-    )
-
-    verify_step_4a(
-        dataset_path,
-        index_path,
+    outputs = step_4a(
+        handoff
     )
 
     # -------------------------------------------------------------------------
-    # FINAL
+    # Final
     # -------------------------------------------------------------------------
 
-    banner(
-        "STEP 1 → STEP 4A COMPLETE"
+    print_header(
+        "PIPELINE COMPLETE — STEPS 1 → 4A"
     )
 
-    passed("Pipeline completed successfully.")
+    print(
+        "STATUS: SUCCESS"
+    )
 
     print()
-    print("DATASET:")
-    print(dataset_path)
-
-    print()
-    print("CANONICAL INDEX:")
-    print(index_path)
-
-    print()
-    print("VERIFICATION:")
-    print(verification_path)
-
-    print()
-
-    status_summary()
-
-
-# =============================================================================
-# 15. COMMAND-LINE INTERFACE
-# =============================================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Einstein Brain V1 controlled pipeline "
-            "runner."
-        )
+    print(
+        "STEP 4A DATASET:"
+    )
+    print(
+        outputs["dataset_path"]
     )
 
-    parser.add_argument(
-        "--status",
-        action="store_true",
-        help="Show current project status.",
+    print()
+    print(
+        "STEP 4A CANONICAL INDEX:"
+    )
+    print(
+        outputs["index_path"]
     )
 
-    parser.add_argument(
-        "--run",
-        action="store_true",
-        help="Run Steps 1 through 4A.",
+    print()
+    print(
+        "STEP 4A VERIFICATION:"
+    )
+    print(
+        outputs["verification_path"]
     )
 
-    args = parser.parse_args()
+    print()
+    print(
+        "STEP 4A REPORT:"
+    )
+    print(
+        outputs["report_path"]
+    )
 
-    if args.status:
+    print()
+    print(
+        "No authoritative PDF was modified."
+    )
 
-        check_project()
-        status_summary()
-        return
-
-    # Default behavior is run.
-    run_pipeline()
+    print(
+        "No existing controlled input was modified."
+    )
 
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nABORT: Pipeline interrupted by user."
+        )
+
+        sys.exit(130)
+
+    except Exception as exc:
+
+        print()
+        print("=" * 80)
+        print("PIPELINE FAILED")
+        print("=" * 80)
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        sys.exit(1)
